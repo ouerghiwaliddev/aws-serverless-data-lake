@@ -21,7 +21,8 @@ Production-grade retail analytics data lake on AWS using serverless technologies
 
 ---
 <img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/5665f2ed-eb93-4e99-bdfe-5f59515e955c" />
-<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/99c6f1aa-a3a7-4383-a25b-8643141c4b3b" />
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/83f24834-d622-44a6-9e29-1935c3fcf93d" />
+
 
 ## Overview
 
