@@ -495,8 +495,8 @@ Should return thousands of partitions like `year=2026/month=05/day=16`.
 
 ## Author
 
-**Ayman Aly Mahmoud**  
-Data Engineer | Azure + AWS | Big Data Engineering  
+**Walid OUERGHI**  
+Data Engineer | Azure + AWS + GCP | Big Data Engineering  
 [LinkedIn](https://linkedin.com/in/ayman-mahmoud) · [GitHub](https://github.com/ayman-aly) · ayman@manara.tech
 
 ---
