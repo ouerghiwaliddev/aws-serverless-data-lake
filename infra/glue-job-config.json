@@ -1,0 +1,59 @@
+{
+  "jobs": [
+    {
+      "name": "bronze-to-silver",
+      "description": "ETL: raw JSON (Bronze) → cleaned Parquet (Silver)",
+      "script": "src/glue_jobs/bronze_to_silver.py",
+      "glue_version": "4.0",
+      "python_version": "3",
+      "worker_type": "G.1X",
+      "number_of_workers": 5,
+      "timeout_minutes": 60,
+      "max_retries": 1,
+      "arguments": {
+        "--job-bookmark-option": "job-bookmark-enable",
+        "--enable-metrics": "true",
+        "--enable-continuous-cloudwatch-log": "true",
+        "--bronze_path": "s3://datalake-bronze-<ACCOUNT_ID>-<ENV>/transactions/",
+        "--silver_path": "s3://datalake-silver-<ACCOUNT_ID>-<ENV>/transactions/"
+      },
+      "schedule": "cron(30 2 * * ? *)"
+    },
+    {
+      "name": "silver-to-gold",
+      "description": "ETL: curated Parquet (Silver) → KPI aggregates (Gold)",
+      "script": "src/glue_jobs/silver_to_gold.py",
+      "glue_version": "4.0",
+      "python_version": "3",
+      "worker_type": "G.1X",
+      "number_of_workers": 3,
+      "timeout_minutes": 60,
+      "max_retries": 1,
+      "arguments": {
+        "--job-bookmark-option": "job-bookmark-enable",
+        "--enable-metrics": "true",
+        "--enable-continuous-cloudwatch-log": "true",
+        "--silver_path": "s3://datalake-silver-<ACCOUNT_ID>-<ENV>/transactions/",
+        "--gold_path": "s3://datalake-gold-<ACCOUNT_ID>-<ENV>/kpis/"
+      },
+      "schedule": "cron(30 3 * * ? *)"
+    }
+  ],
+  "crawlers": [
+    {
+      "name": "datalake-bronze-crawler",
+      "description": "Scans Bronze S3 zone daily and populates the Glue Data Catalog",
+      "target_path": "s3://datalake-bronze-<ACCOUNT_ID>-<ENV>/transactions/",
+      "database": "datalake_bronze",
+      "table_prefix": "transactions_",
+      "schedule": "cron(15 2 * * ? *)",
+      "configuration": {
+        "Version": 1.0,
+        "CrawlerOutput": {
+          "Tables": { "AddOrUpdateBehavior": "MergeNewColumns" },
+          "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+        }
+      }
+    }
+  ]
+}

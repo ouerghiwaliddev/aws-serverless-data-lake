@@ -1,0 +1,689 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS Serverless Data Lake — complete infrastructure stack.
+  Deploys S3 buckets (Bronze/Silver/Gold), Kinesis Firehose, Glue Crawler,
+  Glue ETL Jobs, EventBridge Scheduler, Lambda data quality check,
+  SNS alerts, and all required IAM roles.
+
+# ===========================================================================
+# Parameters
+# ===========================================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  AlertEmail:
+    Type: String
+    Default: alerts@example.com
+    Description: Email address for SNS data quality alerts
+
+  GlueScriptsBucket:
+    Type: String
+    Description: S3 bucket where Glue job scripts are uploaded (must exist)
+
+  FirehoseBufferSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+    Description: Kinesis Firehose buffering interval in seconds
+
+  FirehoseBufferMB:
+    Type: Number
+    Default: 128
+    MinValue: 64
+    MaxValue: 128
+    Description: Kinesis Firehose buffering size in MB
+
+# ===========================================================================
+# Metadata
+# ===========================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Environment" }
+        Parameters: [EnvironmentName]
+      - Label: { default: "Notifications" }
+        Parameters: [AlertEmail]
+      - Label: { default: "Glue" }
+        Parameters: [GlueScriptsBucket]
+      - Label: { default: "Kinesis Firehose" }
+        Parameters: [FirehoseBufferSeconds, FirehoseBufferMB]
+
+# ===========================================================================
+# Resources
+# ===========================================================================
+Resources:
+
+  # -------------------------------------------------------------------------
+  # SNS — Alert topic
+  # -------------------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "datalake-alerts-${EnvironmentName}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: DataLake
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # S3 — Bronze bucket (raw, immutable)
+  # -------------------------------------------------------------------------
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "datalake-bronze-${AWS::AccountId}-${EnvironmentName}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: BronzeToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+      Tags:
+        - Key: Zone
+          Value: Bronze
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # S3 — Silver bucket (curated, partitioned Parquet)
+  # -------------------------------------------------------------------------
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "datalake-silver-${AWS::AccountId}-${EnvironmentName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: SilverExpiry
+            Status: Enabled
+            ExpirationInDays: 730       # 2 years
+      Tags:
+        - Key: Zone
+          Value: Silver
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # S3 — Gold bucket (KPI aggregates for QuickSight / Athena)
+  # -------------------------------------------------------------------------
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "datalake-gold-${AWS::AccountId}-${EnvironmentName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Zone
+          Value: Gold
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # S3 — Athena results bucket
+  # -------------------------------------------------------------------------
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "datalake-athena-results-${AWS::AccountId}-${EnvironmentName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Zone
+          Value: Athena
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # IAM — Kinesis Firehose role
+  # -------------------------------------------------------------------------
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "datalake-firehose-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt BronzeBucket.Arn
+                  - !Sub "${BronzeBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*"
+
+  # -------------------------------------------------------------------------
+  # Kinesis Data Firehose — delivery stream to Bronze
+  # -------------------------------------------------------------------------
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "retail-transactions-firehose-${EnvironmentName}"
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt BronzeBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "transactions/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        ErrorOutputPrefix: "errors/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/!{firehose:error-output-type}/"
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferSeconds
+          SizeInMBs: !Ref FirehoseBufferMB
+        CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/kinesisfirehose/retail-transactions-${EnvironmentName}"
+          LogStreamName: S3Delivery
+
+  # -------------------------------------------------------------------------
+  # IAM — Glue Crawler & ETL role
+  # -------------------------------------------------------------------------
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "datalake-glue-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueDataLakeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BronzeBucket.Arn
+                  - !Sub "${BronzeBucket.Arn}/*"
+                  - !GetAtt SilverBucket.Arn
+                  - !Sub "${SilverBucket.Arn}/*"
+                  - !GetAtt GoldBucket.Arn
+                  - !Sub "${GoldBucket.Arn}/*"
+                  - !Sub "arn:aws:s3:::${GlueScriptsBucket}"
+                  - !Sub "arn:aws:s3:::${GlueScriptsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # Glue — Data Catalog databases
+  # -------------------------------------------------------------------------
+  GlueDatabaseBronze:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "datalake_bronze_${EnvironmentName}"
+        Description: Raw JSON transactions from Kinesis Firehose
+
+  GlueDatabaseSilver:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "datalake_silver_${EnvironmentName}"
+        Description: Curated, deduplicated Parquet transactions
+
+  GlueDatabaseGold:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "datalake_gold_${EnvironmentName}"
+        Description: KPI aggregates ready for QuickSight and Athena
+
+  # -------------------------------------------------------------------------
+  # Glue — Bronze crawler
+  # -------------------------------------------------------------------------
+  BronzeCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "datalake-bronze-crawler-${EnvironmentName}"
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabaseBronze
+      TablePrefix: transactions_
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://datalake-bronze-${AWS::AccountId}-${EnvironmentName}/transactions/"
+      Schedule:
+        ScheduleExpression: "cron(0 1 * * ? *)"    # 1 AM UTC daily
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Tables": {"AddOrUpdateBehavior": "MergeNewColumns"},
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}
+          }
+        }
+      Tags:
+        Environment: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # Glue — Bronze → Silver ETL job
+  # -------------------------------------------------------------------------
+  GlueJobBronzeToSilver:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "bronze-to-silver-${EnvironmentName}"
+      Role: !GetAtt GlueRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${GlueScriptsBucket}/jobs/bronze_to_silver.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-language": python
+        "--job-bookmark-option": job-bookmark-enable
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--bronze_path": !Sub "s3://datalake-bronze-${AWS::AccountId}-${EnvironmentName}/transactions/"
+        "--silver_path": !Sub "s3://datalake-silver-${AWS::AccountId}-${EnvironmentName}/transactions/"
+        "--extra-py-files": !Sub "s3://${GlueScriptsBucket}/jobs/common/spark_utils.py"
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 5
+      Timeout: 60
+      MaxRetries: 1
+      Tags:
+        Environment: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # Glue — Silver → Gold ETL job
+  # -------------------------------------------------------------------------
+  GlueJobSilverToGold:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "silver-to-gold-${EnvironmentName}"
+      Role: !GetAtt GlueRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${GlueScriptsBucket}/jobs/silver_to_gold.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-language": python
+        "--job-bookmark-option": job-bookmark-enable
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--silver_path": !Sub "s3://datalake-silver-${AWS::AccountId}-${EnvironmentName}/transactions/"
+        "--gold_path": !Sub "s3://datalake-gold-${AWS::AccountId}-${EnvironmentName}/kpis/"
+        "--extra-py-files": !Sub "s3://${GlueScriptsBucket}/jobs/common/spark_utils.py"
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 3
+      Timeout: 60
+      MaxRetries: 1
+      Tags:
+        Environment: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # IAM — Lambda execution role (data quality check)
+  # -------------------------------------------------------------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "datalake-lambda-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaDataLakeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BronzeBucket.Arn
+                  - !Sub "${BronzeBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # Lambda — Data quality check function
+  # -------------------------------------------------------------------------
+  DataQualityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "datalake-quality-check-${EnvironmentName}"
+      Runtime: python3.12
+      Handler: data_quality_check.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          BRONZE_BUCKET: !Ref BronzeBucket
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          QUALITY_THRESHOLD: "0.95"
+      Code:
+        ZipFile: |
+          # Placeholder — upload src/lambda/data_quality_check.py via CI/CD or aws cli:
+          # aws lambda update-function-code \
+          #   --function-name datalake-quality-check-dev \
+          #   --zip-file fileb://src/lambda/data_quality_check.zip
+          def lambda_handler(event, context):
+              return {"status": "placeholder — deploy real code"}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # IAM — EventBridge Scheduler role
+  # -------------------------------------------------------------------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "datalake-scheduler-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SchedulerInvokeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DataQualityLambda.Arn
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJobBronzeToSilver}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJobSilverToGold}"
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${BronzeCrawler}"
+
+  # -------------------------------------------------------------------------
+  # EventBridge Scheduler — daily pipeline at 2 AM UTC
+  # Step 1: quality check  (02:00)
+  # Step 2: bronze crawler (02:15)
+  # Step 3: bronze→silver  (02:30)
+  # Step 4: silver→gold    (03:30)
+  # -------------------------------------------------------------------------
+  ScheduleQualityCheck:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "datalake-quality-check-${EnvironmentName}"
+      ScheduleExpression: "cron(0 2 * * ? *)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt DataQualityLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+
+  ScheduleBronzeCrawler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "datalake-bronze-crawler-${EnvironmentName}"
+      ScheduleExpression: "cron(15 2 * * ? *)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Sub "arn:aws:scheduler:::aws-sdk:glue:startCrawler"
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"Name": "datalake-bronze-crawler-${EnvironmentName}"}'
+
+  ScheduleBronzeToSilver:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "datalake-bronze-to-silver-${EnvironmentName}"
+      ScheduleExpression: "cron(30 2 * * ? *)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Sub "arn:aws:scheduler:::aws-sdk:glue:startJobRun"
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"JobName": "bronze-to-silver-${EnvironmentName}"}'
+
+  ScheduleSilverToGold:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "datalake-silver-to-gold-${EnvironmentName}"
+      ScheduleExpression: "cron(30 3 * * ? *)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Sub "arn:aws:scheduler:::aws-sdk:glue:startJobRun"
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"JobName": "silver-to-gold-${EnvironmentName}"}'
+
+  # -------------------------------------------------------------------------
+  # Athena — Workgroup
+  # -------------------------------------------------------------------------
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "datalake-${EnvironmentName}"
+      Description: Serverless data lake queries
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://datalake-athena-results-${AWS::AccountId}-${EnvironmentName}/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240    # 10 GB safety limit
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # -------------------------------------------------------------------------
+  # CloudWatch — Dashboard
+  # -------------------------------------------------------------------------
+  DataLakeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "DataLake-${EnvironmentName}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Firehose — Incoming Records",
+                "metrics": [["AWS/Firehose","IncomingRecords","DeliveryStreamName","retail-transactions-firehose-${EnvironmentName}"]],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Data Quality Score",
+                "metrics": [["DataLake","QualityScore","Zone","Bronze"]],
+                "period": 86400,
+                "stat": "Average",
+                "view": "timeSeries",
+                "yAxis": {"left": {"min": 0, "max": 1}}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Athena — Data Scanned (GB)",
+                "metrics": [["AWS/Athena","DataScannedInBytes","WorkGroup","datalake-${EnvironmentName}"]],
+                "period": 3600,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Quality Check — Duration",
+                "metrics": [["AWS/Lambda","Duration","FunctionName","datalake-quality-check-${EnvironmentName}"]],
+                "period": 86400,
+                "stat": "Average",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ===========================================================================
+# Outputs
+# ===========================================================================
+Outputs:
+
+  BronzeBucketName:
+    Description: S3 Bronze bucket (raw data)
+    Value: !Ref BronzeBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BronzeBucket"
+
+  SilverBucketName:
+    Description: S3 Silver bucket (curated Parquet)
+    Value: !Ref SilverBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-SilverBucket"
+
+  GoldBucketName:
+    Description: S3 Gold bucket (KPI aggregates)
+    Value: !Ref GoldBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-GoldBucket"
+
+  FirehoseStreamName:
+    Description: Kinesis Firehose delivery stream name
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub "${AWS::StackName}-FirehoseStream"
+
+  GlueDatabaseBronzeName:
+    Description: Glue Data Catalog database — Bronze
+    Value: !Ref GlueDatabaseBronze
+
+  GlueDatabaseSilverName:
+    Description: Glue Data Catalog database — Silver
+    Value: !Ref GlueDatabaseSilver
+
+  GlueDatabaseGoldName:
+    Description: Glue Data Catalog database — Gold
+    Value: !Ref GlueDatabaseGold
+
+  AthenaWorkgroupName:
+    Description: Athena workgroup for data lake queries
+    Value: !Ref AthenaWorkgroup
+
+  AlertTopicArn:
+    Description: SNS topic ARN for data quality alerts
+    Value: !Ref AlertTopic
+
+  DataQualityLambdaArn:
+    Description: ARN of the data quality Lambda function
+    Value: !GetAtt DataQualityLambda.Arn
+
+  CloudWatchDashboardURL:
+    Description: CloudWatch dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=DataLake-${EnvironmentName}"
