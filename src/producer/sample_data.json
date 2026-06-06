@@ -1,0 +1,16 @@
+{
+  "transaction_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "timestamp": "2026-05-16T14:30:00Z",
+  "store_id": "store-001",
+  "region": "North",
+  "product_id": "P001",
+  "product_name": "Laptop Pro 15",
+  "category": "Electronics",
+  "quantity": 1,
+  "unit_price": 1169.99,
+  "discount_pct": 0.10,
+  "total_amount": 1169.99,
+  "payment_method": "credit_card",
+  "customer_id": "cust-4521",
+  "is_return": false
+}
